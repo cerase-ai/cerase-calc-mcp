@@ -1,0 +1,202 @@
+name: Build & publish Docker image
+
+# Publishes ghcr.io/cerase-ai/cerase-calc-mcp from this repo (canonical
+# source). The publish is gated on the tests, which need no network and no
+# docker, on the repo's guards, and on a call to the built image over MCP.
+# Tagging matches the platform convention:
+#   - push to main           → main, latest, sha-<short>
+#   - push of a `v*` git tag → vX.Y.Z, X.Y, latest
+#   - pull_request           → build-only validation, no push
+#   - workflow_dispatch      → manual trigger from the Actions UI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Serialise publishes per ref; cancel superseded branch builds (the newest
+# push wins so an older in-flight build can't move :latest backwards). Tag
+# builds are never cancelled — a release must complete.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: cerase-calc-mcp
+  GITLEAKS_VERSION: 8.21.2
+
+jobs:
+  # Cheap grep-only gate: the runtime-spawned MCP containers have no compose
+  # healthcheck and run as an unprivileged uid, so the image MUST declare a
+  # non-root USER, a pinned base (reproducible builds), and a HEALTHCHECK
+  # (the only liveness signal doctor/`docker ps` see). Fails the build early.
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Dockerfile hygiene (non-root USER, pinned base, HEALTHCHECK)
+        run: |
+          set -euo pipefail
+          df=Dockerfile
+
+          user_line=$(grep -E '^USER ' "$df" | tail -n1 || true)
+          if [ -z "$user_line" ]; then
+            echo "::error file=$df::no USER instruction — image would run as root"; exit 1
+          fi
+          user=$(echo "$user_line" | awk '{print $2}')
+          if [ "$user" = root ] || [ "$user" = 0 ]; then
+            echo "::error file=$df::USER is root ($user)"; exit 1
+          fi
+          echo "OK: non-root USER=$user"
+
+          from_line=$(grep -E '^FROM ' "$df" | tail -n1 || true)
+          if ! echo "$from_line" | grep -Eq '@sha256:[0-9a-f]{64}|:[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error file=$df::base image not pinned to MAJOR.MINOR.PATCH or @sha256: $from_line"; exit 1
+          fi
+          echo "OK: pinned base — $from_line"
+
+          if ! grep -Eq '^HEALTHCHECK ' "$df"; then
+            echo "::error file=$df::no HEALTHCHECK instruction"; exit 1
+          fi
+          echo "OK: HEALTHCHECK present"
+
+      # README.md's tool table is what an installer reads to learn what this
+      # connector does. build-and-push needs this job, so an image whose server
+      # registers a tool the README omits, or lacks one it lists, is never
+      # pushed. The script is the same file in every connector repo, and the
+      # digest reds an edit to it that did not also change its pin.
+      - name: README lists exactly the tools server.py registers
+        run: |
+          set -euo pipefail
+          sha256sum -c scripts/readme-tools-check.sha256
+          python3 scripts/readme-tools-check.py
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install test deps
+        run: pip install --disable-pip-version-check -r requirements-dev.txt
+      - name: Tests (exact results, every refusal with its reason, the MCP surface)
+        run: python -m pytest tests/ -q
+
+  guards:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # The secret scan reads every commit: a secret committed and later
+          # removed is still published.
+          fetch-depth: 0
+      # scripts/ghcr-retention.sh and scripts/docs-parity.sh are cerase-core's,
+      # copied here by its scripts/sync-tooling.sh. The pin is what makes each
+      # copy a copy, and the seal pins the pin.
+      - name: Vendored tooling matches the sha it recorded
+        run: sha256sum --check scripts/TOOLING.sha256 scripts/TOOLING.seal
+      - name: Docs parity — nothing named that does not exist
+        run: ./scripts/docs-parity.sh
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+      - name: Secret scan over the whole history
+        run: gitleaks detect --source . --redact --verbose --no-banner --exit-code 1
+
+  build-and-push:
+    needs: [hygiene, test, guards]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # The unit tests import server.py, so they cannot see an image whose
+      # entrypoint, dependencies or bridge are broken. The image about to be
+      # pushed is started, must turn healthy, and must answer a calculation and
+      # a refusal over MCP; a failure stops the push.
+      - name: Build the image for the smoke run
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          push: false
+          tags: cerase-calc-mcp:smoke
+          cache-from: type=gha,scope=${{ env.IMAGE }}
+          provenance: false
+
+      - name: The built image answers over MCP
+        run: |
+          set -euo pipefail
+          docker run -d --name calc-smoke -p 127.0.0.1:3000:3000 cerase-calc-mcp:smoke
+          status=starting
+          for _ in $(seq 1 60); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' calc-smoke)
+            [ "$status" = healthy ] && break
+            [ "$status" = unhealthy ] && break
+            sleep 1
+          done
+          if [ "$status" != healthy ]; then
+            echo "::error::the container is $status"; docker logs calc-smoke; exit 1
+          fi
+          python3 scripts/smoke.py http://127.0.0.1:3000/mcp || { docker logs calc-smoke; exit 1; }
+          docker rm -f calc-smoke >/dev/null
+
+      # This package is new and this repo creates it, so the job token owns it
+      # from the first push and no PAT is needed.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata + tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short
+          labels: |
+            org.opencontainers.image.title=cerase-calc-mcp
+            org.opencontainers.image.description=Exact decimal arithmetic for the Cerase assistant: expressions, sums, products and rounding, each result in machine and Italian form
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.licenses=MIT
+
+      - name: Build & push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ env.IMAGE }}
+          cache-to: type=gha,mode=max,scope=${{ env.IMAGE }}
+          provenance: false

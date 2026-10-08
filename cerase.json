@@ -1,0 +1,26 @@
+{
+  "schema_version": 2,
+  "namespace": "studio.guidance",
+  "name": "cerase-calc",
+  "type": "connector",
+  "display_name": "Cerase Calc",
+  "description": "Exact decimal arithmetic for the figures in documents and mail: expressions, sums, products and rounding, each result also in Italian form.",
+  "license": "MIT",
+  "install": {
+    "image": "ghcr.io/cerase-ai/cerase-calc-mcp:latest"
+  },
+  "auth": {
+    "kind": "none",
+    "credential_scope": "tenant"
+  },
+  "tool_side_effects": {
+    "default": "workspace_write",
+    "read_only": ["calculate", "sum", "product", "round"]
+  },
+  "tool_runtime": {
+    "default": {
+      "pool": "fast",
+      "timeout_seconds": 10
+    }
+  }
+}

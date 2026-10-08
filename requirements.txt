@@ -1,0 +1,14 @@
+# cerase-calc MCP — Python dependencies; requirements.lock pins them.
+#
+# FastMCP stdio server bridged to HTTP/SSE by mcp-proxy, the same shape as every
+# other cerase-* MCP image. The arithmetic is the standard library's `decimal`,
+# so nothing else is needed. Update + rebuild the image to bump.
+#
+# mcp stays on 1.x, and the lock holds the mcp and mcp-proxy the universal
+# runner pins. mcp-proxy is this image's entrypoint, asks only for mcp>=1.17, and
+# imports `request_ctx` from `mcp.server.lowlevel.server`, which the 2.x SDK
+# removed: under 2.x the image builds and the container exits on its first
+# import. server.py uses the 1.x API (`FastMCP`) until an mcp-proxy release
+# imports under 2.x.
+mcp>=1.30.0,<2.0
+mcp-proxy>=0.12.0,<1.0
