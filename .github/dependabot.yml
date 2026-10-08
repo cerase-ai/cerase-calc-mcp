@@ -8,6 +8,13 @@ updates:
     schedule: { interval: weekly }
     open-pull-requests-limit: 1
     labels: [deps, python]
+    # mcp-proxy, the image's entrypoint, imports a name the 2.x SDK removed, and
+    # server.py uses the 1.x FastMCP API, so a major bump of mcp builds an image
+    # that exits at start. It moves when an mcp-proxy release imports under 2.x,
+    # together with the universal runner's pin in cerase-core.
+    ignore:
+      - dependency-name: mcp
+        update-types: ["version-update:semver-major"]
     groups:
       python:
         patterns: ["*"]
