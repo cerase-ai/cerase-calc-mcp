@@ -13,6 +13,7 @@ Standard library only, so it runs on a CI runner with nothing installed.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import urllib.request
 
@@ -22,6 +23,9 @@ TOOLS = {"calculate", "sum", "product", "round"}
 
 def _post(body: dict, session: str | None) -> tuple[dict, str | None]:
     headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    # The gate in front of the bridge answers only this runner's own token.
+    if os.environ.get("CERASE_RUNNER_TOKEN"):
+        headers["X-Cerase-Runner-Token"] = os.environ["CERASE_RUNNER_TOKEN"]
     if session:
         headers["Mcp-Session-Id"] = session
     request = urllib.request.Request(ENDPOINT, data=json.dumps(body).encode(), headers=headers, method="POST")

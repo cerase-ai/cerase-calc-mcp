@@ -147,7 +147,7 @@ jobs:
       - name: The built image answers over MCP
         run: |
           set -euo pipefail
-          docker run -d --name calc-smoke -p 127.0.0.1:3000:3000 cerase-calc-mcp:smoke
+          docker run -d --name calc-smoke -e CERASE_RUNNER_TOKEN=smoke -p 127.0.0.1:3000:3000 cerase-calc-mcp:smoke
           status=starting
           for _ in $(seq 1 60); do
             status=$(docker inspect -f '{{.State.Health.Status}}' calc-smoke)
@@ -158,7 +158,7 @@ jobs:
           if [ "$status" != healthy ]; then
             echo "::error::the container is $status"; docker logs calc-smoke; exit 1
           fi
-          python3 scripts/smoke.py http://127.0.0.1:3000/mcp || { docker logs calc-smoke; exit 1; }
+          CERASE_RUNNER_TOKEN=smoke python3 scripts/smoke.py http://127.0.0.1:3000/mcp || { docker logs calc-smoke; exit 1; }
           docker rm -f calc-smoke >/dev/null
 
       # This package is new and this repo creates it, so the job token owns it
